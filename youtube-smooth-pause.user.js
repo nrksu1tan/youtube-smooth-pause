@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Smooth Pause & Play
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  userscript that adds a native smooth volume fade out/in effect when pausing or playing YouTube videos. Protects your ears from abrupt audio stops.
 // @author       @nrksu1tan
 // @match        *://*.youtube.com/*
@@ -16,6 +16,7 @@
 
     const CONFIG = {
         FADE_MS: 300,
+        RESTORE_DELAY_MS: 100,
         STORAGE: 'yt_smooth_pause_enabled',
         UI: {
             VIDEO_CLASS: 'html5-main-video',
@@ -31,51 +32,133 @@
 
     const audioEngines = new WeakMap();
 
+    // Time of the last real user input. Used to tell a user's second press
+    // during a fade-out apart from YouTube calling pause() twice internally.
+    let lastUserInput = 0;
+    const markInput = () => { lastUserInput = performance.now(); };
+    window.addEventListener('keydown', markInput, true);
+    window.addEventListener('pointerdown', markInput, true);
+
     class AudioEngine {
         constructor(video) {
             this.video = video;
-            this.animId = null;
-            this.baseVol = rawVolume.get.call(video) || 1;
+            this.animId = 0;
+            this.timerId = 0;
+            this.restoreId = 0;
+            this.baseVol = rawVolume.get.call(video);
             this.fading = false;
+            this.pendingPause = false;
+            this.pauseStartedAt = 0;
+        }
+
+        getRaw() {
+            return rawVolume.get.call(this.video);
         }
 
         setVol(val) {
             rawVolume.set.call(this.video, Math.max(0, Math.min(1, val)));
         }
 
-        fade(target, ms, cb) {
+        stop() {
             cancelAnimationFrame(this.animId);
+            clearTimeout(this.timerId);
+            clearTimeout(this.restoreId);
+            this.animId = this.timerId = this.restoreId = 0;
+            this.fading = false;
+        }
+
+        // getTarget is a function so a volume change during a fade-in is respected.
+        fade(getTarget, ms, cb) {
+            this.stop();
+
+            const finish = () => {
+                this.stop();
+                this.setVol(getTarget());
+                if (cb) cb();
+            };
+
+            // rAF does not run in background tabs, so finish immediately there.
+            if (document.hidden || ms <= 0) {
+                finish();
+                return;
+            }
+
             this.fading = true;
-            const start = rawVolume.get.call(this.video);
+            const start = this.getRaw();
             const t0 = performance.now();
 
             const step = (t) => {
-                let p = (t - t0) / ms;
-                if (p >= 1) p = 1;
+                const p = Math.max(0, Math.min(1, (t - t0) / ms));
                 const ease = 1 - Math.pow(1 - p, 3);
+                const target = getTarget();
                 this.setVol(start + (target - start) * ease);
 
                 if (p < 1) {
                     this.animId = requestAnimationFrame(step);
                 } else {
-                    this.fading = false;
-                    if (cb) cb();
+                    finish();
                 }
             };
             this.animId = requestAnimationFrame(step);
+            // Fallback in case rAF gets throttled mid-fade (tab switched).
+            this.timerId = setTimeout(finish, ms + 150);
+        }
+
+        fadeIn() {
+            this.fade(() => this.baseVol, CONFIG.FADE_MS);
+        }
+
+        fadeOutAndPause() {
+            if (!this.fading && this.getRaw() > 0) this.baseVol = this.getRaw();
+            this.pendingPause = true;
+            this.pauseStartedAt = performance.now();
+            this.fade(() => 0, CONFIG.FADE_MS, () => {
+                this.pendingPause = false;
+                rawPause.call(this.video);
+                this.scheduleRestore();
+            });
+        }
+
+        // Once paused, put the real volume back, so a play that bypasses
+        // our play() (media keys, native controls) is never silent.
+        scheduleRestore() {
+            clearTimeout(this.restoreId);
+            this.restoreId = setTimeout(() => {
+                this.restoreId = 0;
+                if (this.video.paused && !this.fading) this.setVol(this.baseVol);
+            }, CONFIG.RESTORE_DELAY_MS);
+        }
+
+        // Cancel everything at once and return to the normal state.
+        reset(pauseIfPending) {
+            const wasPending = this.pendingPause;
+            this.pendingPause = false;
+            this.stop();
+            if (wasPending && pauseIfPending) rawPause.call(this.video);
+            this.setVol(this.baseVol);
         }
     }
 
     function getEngine(v) {
-        if (!audioEngines.has(v)) audioEngines.set(v, new AudioEngine(v));
-        return audioEngines.get(v);
+        let e = audioEngines.get(v);
+        if (!e) {
+            e = new AudioEngine(v);
+            audioEngines.set(v, e);
+        }
+        return e;
     }
 
     function isShorts() {
         return window.location.pathname.startsWith('/shorts/');
     }
 
+    function shouldHandle(v) {
+        return isEnabled && !isShorts() && !!v.classList?.contains(CONFIG.UI.VIDEO_CLASS);
+    }
+
     Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
+        configurable: true,
+        enumerable: true,
         get() {
             const e = audioEngines.get(this);
             return e ? e.baseVol : rawVolume.get.call(this);
@@ -88,30 +171,73 @@
     });
 
     HTMLMediaElement.prototype.play = function() {
-        if (!isEnabled || isShorts() || !this.classList?.contains(CONFIG.UI.VIDEO_CLASS)) {
-            const e = audioEngines.get(this);
-            if (e && rawVolume.get.call(this) === 0 && e.baseVol > 0) {
-                rawVolume.set.call(this, e.baseVol);
+        const existing = audioEngines.get(this);
+
+        if (!shouldHandle(this)) {
+            if (existing && (existing.fading || existing.pendingPause || existing.getRaw() !== existing.baseVol)) {
+                existing.reset(false);
             }
             return rawPlay.call(this);
         }
 
         const e = getEngine(this);
-        if (rawVolume.get.call(this) > 0 && !e.fading) e.baseVol = rawVolume.get.call(this);
+
+        // play() during a fade-out: the video is still playing, just fade back in.
+        if (e.pendingPause) {
+            e.pendingPause = false;
+            e.fadeIn();
+            return rawPlay.call(this);
+        }
+
+        // Already playing (YouTube does this after seeking/buffering): no volume dip.
+        if (!this.paused) {
+            return rawPlay.call(this);
+        }
+
+        if (!e.fading && e.getRaw() > 0) e.baseVol = e.getRaw();
+        e.stop();
         e.setVol(0);
 
         const p = rawPlay.call(this);
-        const up = () => e.fade(e.baseVol, CONFIG.FADE_MS);
-        p ? p.then(up).catch(() => {}) : up();
+        if (p && typeof p.then === 'function') {
+            // On rejection (autoplay blocked / AbortError) put the volume back.
+            p.then(() => e.fadeIn(), () => { if (!e.pendingPause) e.reset(false); });
+        } else {
+            e.fadeIn();
+        }
         return p;
     };
 
     HTMLMediaElement.prototype.pause = function() {
-        if (!isEnabled || isShorts() || !this.classList?.contains(CONFIG.UI.VIDEO_CLASS) || this.paused) {
+        const existing = audioEngines.get(this);
+
+        if (!shouldHandle(this) || this.paused) {
+            if (existing && (existing.pendingPause || existing.fading)) existing.reset(false);
             return rawPause.call(this);
         }
-        getEngine(this).fade(0, CONFIG.FADE_MS, () => rawPause.call(this));
+
+        const e = getEngine(this);
+
+        if (e.pendingPause) {
+            // YouTube only learns about the pause from the 'pause' event, which
+            // fires after the fade. So a second press of space/K during the fade
+            // arrives as another pause() even though the user wants to resume.
+            if (lastUserInput > e.pauseStartedAt) {
+                e.pendingPause = false;
+                e.fadeIn();
+            }
+            return;
+        }
+
+        e.fadeOutAndPause();
     };
+
+    function updateButton(btn) {
+        btn.style.opacity = isEnabled ? '1' : '0.4';
+        btn.setAttribute('title', isEnabled ? 'Smooth Pause: ON' : 'Smooth Pause: OFF');
+        btn.setAttribute('aria-label', btn.getAttribute('title'));
+        btn.setAttribute('aria-pressed', String(isEnabled));
+    }
 
     function ensureUI() {
         if (document.getElementById(CONFIG.UI.BTN_ID)) return;
@@ -121,40 +247,43 @@
         const btn = document.createElement('button');
         btn.id = CONFIG.UI.BTN_ID;
         btn.className = 'ytp-button';
-        btn.setAttribute('title', isEnabled ? 'Smooth Pause: ON' : 'Smooth Pause: OFF');
+        btn.type = 'button';
 
-        btn.style.width = 'auto';
-        btn.style.minWidth = '36px';
-        btn.style.padding = '0 5px';
-        btn.style.opacity = isEnabled ? '1' : '0.4';
-        btn.style.transition = 'opacity 0.2s';
-        btn.style.fontSize = '14px';
-        btn.style.fontWeight = 'bold';
-        btn.style.color = '#fff';
-        btn.style.textAlign = 'center';
-        btn.style.verticalAlign = 'top';
-        btn.innerText = 'SP';
+        Object.assign(btn.style, {
+            width: 'auto',
+            minWidth: '36px',
+            padding: '0 5px',
+            transition: 'opacity 0.2s',
+            fontSize: '14px',
+            fontWeight: 'bold',
+            color: '#fff',
+            textAlign: 'center',
+            verticalAlign: 'top'
+        });
+        btn.textContent = 'SP';
+        updateButton(btn);
 
-        btn.onclick = (e) => {
+        // Never take focus on click: otherwise space "clicks" this button
+        // instead of reaching YouTube's play/pause hotkey.
+        btn.addEventListener('mousedown', (e) => e.preventDefault());
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
             isEnabled = !isEnabled;
             localStorage.setItem(CONFIG.STORAGE, String(isEnabled));
-            btn.style.opacity = isEnabled ? '1' : '0.4';
-            btn.setAttribute('title', isEnabled ? 'Smooth Pause: ON' : 'Smooth Pause: OFF');
+            updateButton(btn);
 
             if (!isEnabled) {
                 document.querySelectorAll('video').forEach(v => {
                     const eng = audioEngines.get(v);
-                    if (eng && rawVolume.get.call(v) === 0 && eng.baseVol > 0) {
-                        cancelAnimationFrame(eng.animId);
-                        eng.fading = false;
-                        rawVolume.set.call(v, eng.baseVol);
-                    }
+                    if (eng) eng.reset(true);
                 });
             }
 
-            e.preventDefault();
-            e.stopPropagation();
-        };
+            btn.blur();
+        });
 
         controls.insertBefore(btn, controls.firstChild);
     }
